@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from torchspec.utils.device import get_accelerator_device_type, get_accelerator_module
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
@@ -343,7 +345,10 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         rng_state = checkpoint_payload["rng"]
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
-        if torch.cuda.is_available() and "cuda" in rng_state:
+        accel = get_accelerator_device_type()
+        if accel != "cpu" and accel in rng_state:
+            get_accelerator_module().set_rng_state_all(rng_state[accel])
+        elif torch.cuda.is_available() and "cuda" in rng_state:
             torch.cuda.set_rng_state_all(rng_state["cuda"])
 
     metadata = checkpoint_payload.get("metadata") or {}
@@ -360,7 +365,7 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     if continual_training and hasattr(actor, "optimizer"):
         _restore_fp32_master_params(actor, checkpoint_payload["optimizer_dir"])
 
-    torch.cuda.synchronize()
+    get_accelerator_module().synchronize()
     dist.barrier()
 
 
@@ -370,7 +375,7 @@ def save(actor: Any, step: int) -> None:
     Saves model weights and optimizer state to separate directories.
     This allows loading weights without optimizer or deleting optimizer before loading.
     """
-    torch.cuda.synchronize()
+    get_accelerator_module().synchronize()
 
     base_dir = Path(actor.args.checkpoint_dir).expanduser()
     step_id = step + 1
@@ -403,7 +408,9 @@ def save(actor: Any, step: int) -> None:
 
     if dist.get_rank() == 0:
         rng_state = {"torch": torch.get_rng_state()}
-        rng_state["cuda"] = torch.cuda.get_rng_state_all()
+        accel = get_accelerator_device_type()
+        if accel != "cpu":
+            rng_state[accel] = get_accelerator_module().get_rng_state_all()
         torch.save(rng_state, checkpoint_dir / "rng.pt")
 
         metadata = {

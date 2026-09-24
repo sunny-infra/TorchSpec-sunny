@@ -80,10 +80,14 @@ class TargetLMHead(nn.Module):
         norm_key: str = "model.norm.weight",
         load_norm: bool = False,
         cache_dir: Optional[str] = None,
-        device: str = "cuda",
+        device: str | None = None,
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
     ) -> "TargetLMHead":
+        from torchspec.utils.device import get_accelerator_device_type
+
+        if device is None:
+            device = get_accelerator_device_type()
         config = AutoConfig.from_pretrained(
             model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
@@ -297,7 +301,7 @@ def load_synced_target_lm_head(
     lm_head_key: str = "lm_head.weight",
     norm_key: str = "model.norm.weight",
     trust_remote_code: bool = True,
-    device: str = "cuda",
+    device: str | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> "TargetLMHead":
     """Build a frozen ``TargetLMHead`` on every rank, reading the checkpoint once.
@@ -307,6 +311,10 @@ def load_synced_target_lm_head(
     same way on all of them: each rank either ends up with the final norm or raises,
     which is what keeps the parameter lists aligned across the broadcast.
     """
+    from torchspec.utils.device import get_accelerator_device_type
+
+    if device is None:
+        device = get_accelerator_device_type()
     rank = dist.get_rank()
 
     head: Optional[TargetLMHead] = None

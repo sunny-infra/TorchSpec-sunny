@@ -91,7 +91,9 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
     mooncake_config = build_mooncake_config(args)
     engines = create_inference_engines(args, inference_pg, mooncake_config)
 
-    saver = OfflineSavingActor.remote(output_dir, mooncake_config)
+    saver = OfflineSavingActor.options(
+        runtime_env={"env_vars": get_torchspec_env_vars()},
+    ).remote(output_dir, mooncake_config)
     train_queues, eval_queues = ray.get(
         [controller.get_train_queues.remote(), controller.get_eval_queues.remote()]
     )

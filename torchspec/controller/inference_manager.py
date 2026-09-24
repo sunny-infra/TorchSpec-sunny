@@ -70,6 +70,10 @@ class EnginePool:
         self._next_idx = (self._next_idx + 1) % len(self._engines)
         return engine
 
+    def all(self) -> list:
+        """Return every engine, in DP rank order."""
+        return list(self._engines)
+
     @property
     def semaphore(self) -> asyncio.Semaphore:
         return self._semaphore
@@ -162,6 +166,8 @@ class AsyncInferenceManager:
         self.controller = controller
 
         self._engines = EnginePool(inference_engines or [], max_concurrent_batches)
+        # vLLM expert-parallel DP deadlocks unless every rank enters generate together.
+        self._lockstep_engines = int(getattr(args, "vllm_dp_size", 1) or 1) > 1
         self._metrics = MetricsCollector()
 
         self._prompt_buffer: deque[InferenceInput] = deque()
@@ -294,17 +300,24 @@ class AsyncInferenceManager:
 
     async def _dispatch_ready_batches(self) -> None:
         """Dispatch batches from buffer, up to the engine concurrency limit."""
+        group = len(self._engines) if self._lockstep_engines else 1
+        need = self._batch_size * group
         while (
-            len(self._prompt_buffer) >= self._batch_size
+            len(self._prompt_buffer) >= need
             and len(self._pending_tasks) < self._engines.max_concurrent
         ):
             await self._await_pool_capacity()
-            entries = self._take_batch(self._batch_size)
-            task = asyncio.create_task(self._dispatch_batch(entries))
+            if self._lockstep_engines:
+                batches = [self._take_batch(self._batch_size) for _ in range(group)]
+                task = asyncio.create_task(self._dispatch_lockstep(batches))
+            else:
+                entries = self._take_batch(self._batch_size)
+                task = asyncio.create_task(self._dispatch_batch(entries))
             self._pending_tasks.add(task)
 
         if (
-            self._source_dry
+            not self._lockstep_engines
+            and self._source_dry
             and 0 < len(self._prompt_buffer) < self._batch_size
             and len(self._pending_tasks) < self._engines.max_concurrent
         ):
@@ -439,6 +452,61 @@ class AsyncInferenceManager:
             "return_logits": not self._return_hidden_states,
             "multimodal_inputs": multimodal_inputs if has_multimodal else None,
         }
+
+    async def _dispatch_lockstep(
+        self, batches: list[list[InferenceInput]]
+    ) -> list[tuple[InferenceInput, dict | Exception]]:
+        """Run generate() on every DP rank in one step.
+
+        Expert-parallel all-to-all deadlocks if any rank skips the forward.
+        """
+        async with self._engines.semaphore:
+            tasks = [
+                asyncio.create_task(self._generate_on_engine(engine, entries))
+                for engine, entries in zip(self._engines.all(), batches, strict=True)
+            ]
+            results = await asyncio.gather(*tasks)
+            paired: list[tuple[InferenceInput, dict | Exception]] = []
+            for entries, outputs in zip(batches, results, strict=True):
+                paired.extend(outputs)
+            return paired
+
+    async def _generate_on_engine(
+        self, engine, entries: list[InferenceInput]
+    ) -> list[tuple[InferenceInput, dict | Exception]]:
+        kwargs = self._prepare_engine_inputs(entries)
+        try:
+            if self._enable_perf_metrics:
+                t0 = time.time()
+            generate_method = (
+                engine.generate_with_decode if self._train_with_decode else engine.generate
+            )
+            outputs = await generate_method.remote(
+                data_id=kwargs["data_ids"],
+                input_ids_ref=kwargs["input_ids_ref"],
+                packed_loss_mask_list=kwargs["packed_loss_mask_list"],
+                formatted_prompts=kwargs["formatted_prompts"],
+                return_last_hidden_states=kwargs["return_last_hidden_states"],
+                return_logits=kwargs["return_logits"],
+                multimodal_inputs=kwargs["multimodal_inputs"],
+            )
+            if self._enable_perf_metrics:
+                now = time.time()
+                self._batch_times.append((len(entries), now - t0, now))
+            if len(outputs) != len(entries):
+                err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
+                return [(entry, err) for entry in entries]
+            return list(zip(entries, outputs, strict=True))
+        except RayActorError as e:
+            logger.critical(f"Engine actor died, terminating inference manager: {e}")
+            self._running = False
+            await self.controller.set_inference_error.remote(str(e))
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Engine dispatch failed: {e}\n{traceback.format_exc()}")
+            return [(entry, e) for entry in entries]
 
     async def _dispatch_batch(
         self, entries: list[InferenceInput]

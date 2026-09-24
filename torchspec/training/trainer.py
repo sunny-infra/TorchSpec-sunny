@@ -46,6 +46,11 @@ from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.distributed import get_gloo_group, get_usp_device_mesh, get_usp_grad_sync_mesh
+from torchspec.utils.device import (
+    accelerator_event,
+    current_accelerator_device,
+    get_accelerator_device_type,
+)
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -63,17 +68,17 @@ class DeferredTrainMetrics:
 
     cpu_values: torch.Tensor
     source_values: torch.Tensor
-    ready_event: torch.cuda.Event
+    ready_event: object
     metric_step: int
     finalize_values: Callable[[list[float]], dict]
     data_time: float = 0.0
-    compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(
+    compute_events: list[tuple[object, object]] = dataclasses.field(
         default_factory=list
     )
-    optimizer_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(
+    optimizer_events: list[tuple[object, object]] = dataclasses.field(
         default_factory=list
     )
-    step_events: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+    step_events: Optional[tuple[object, object]] = None
 
     def finalize(self) -> dict:
         if self.step_events is not None:
@@ -175,7 +180,7 @@ class Trainer(abc.ABC):
         self.dp_size = world_size
         self.dp_rank = rank
 
-        self.mesh = init_device_mesh("cuda", mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
+        self.mesh = init_device_mesh(get_accelerator_device_type(), mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
         self.dp_group = self.mesh.get_group("dp")
         self.dp_mesh = self.mesh
         self.grad_sync_mesh = self.dp_mesh
@@ -212,7 +217,7 @@ class Trainer(abc.ABC):
         )
 
         store = EagleMooncakeStore(mooncake_config)
-        store.setup(device=torch.cuda.current_device())
+        store.setup(device=current_accelerator_device())
         self.mooncake_store = store
         logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore initialized")
         return store
@@ -238,7 +243,7 @@ class Trainer(abc.ABC):
         collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
-        gpu_device = torch.cuda.current_device()
+        gpu_device = current_accelerator_device()
 
         # When prefetching, stage data on CPU to avoid GPU contention between
         # background Mooncake TCP transfers and forward/backward compute.
@@ -298,7 +303,7 @@ class Trainer(abc.ABC):
             queue=queue,
             mooncake_store=self.mooncake_store,
             collator=collator,
-            device=torch.cuda.current_device(),
+            device=current_accelerator_device(),
             batch_size=per_dp_rank_batch_size,
             assistant_header_ids=self.assistant_header_ids,
             end_token_ids=self.end_token_ids,
@@ -375,8 +380,8 @@ class Trainer(abc.ABC):
         perf = self._enable_perf_metrics
         if perf:
             t0 = time.time()
-            step_start = torch.cuda.Event(enable_timing=True)
-            step_end = torch.cuda.Event(enable_timing=True)
+            step_start = accelerator_event(enable_timing=True)
+            step_end = accelerator_event(enable_timing=True)
             step_start.record()
         metrics = self._train_core_from_queue(step=step, num_batches=num_batches)
         if isinstance(metrics, DeferredTrainMetrics):
@@ -414,7 +419,7 @@ class Trainer(abc.ABC):
         perf = self._enable_perf_metrics
         if perf:
             data_time = 0.0
-            compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+            compute_events: list[tuple[object, object]] = []
             t_data_start = time.time()
 
         # Gradient sync control for micro-batch accumulation.
@@ -430,8 +435,8 @@ class Trainer(abc.ABC):
 
             if perf:
                 data_time += time.time() - t_data_start
-                evt_start = torch.cuda.Event(enable_timing=True)
-                evt_end = torch.cuda.Event(enable_timing=True)
+                evt_start = accelerator_event(enable_timing=True)
+                evt_end = accelerator_event(enable_timing=True)
                 evt_start.record()
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -454,8 +459,8 @@ class Trainer(abc.ABC):
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
-                _evt_opt_s = torch.cuda.Event(enable_timing=True)
-                _evt_opt_e = torch.cuda.Event(enable_timing=True)
+                _evt_opt_s = accelerator_event(enable_timing=True)
+                _evt_opt_e = accelerator_event(enable_timing=True)
                 _evt_opt_s.record()
                 grad_norm = self.optimizer.step()
                 _evt_opt_e.record()

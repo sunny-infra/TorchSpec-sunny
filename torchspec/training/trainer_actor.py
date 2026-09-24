@@ -29,6 +29,7 @@ from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dflash2 import DFlash2Config
 from torchspec.models.draft.dspark import DSparkConfig
 from torchspec.ray.ray_actor import RayActor
+from torchspec.utils.device import default_distributed_backend
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
 from torchspec.utils.logging import setup_file_logging
 
@@ -69,10 +70,12 @@ class TrainerActor(RayActor):
     def init(self, args: Namespace, role: str, mooncake_config=None, with_ref: bool = False) -> int:
         self.args = args
 
-        backend = getattr(args, "distributed_backend", "nccl")
+        backend = getattr(args, "distributed_backend", None) or default_distributed_backend()
         if getattr(args, "fsdp_cpu_offload", False) and getattr(args, "fsdp_cpu_backend", None):
             cpu_backend = args.fsdp_cpu_backend
-            backend = f"cpu:{cpu_backend},cuda:{backend}"
+            from torchspec.utils.device import get_accelerator_device_type
+            accel = get_accelerator_device_type()
+            backend = f"cpu:{cpu_backend},{accel}:{backend}"
 
         dist.init_process_group(
             backend=backend,

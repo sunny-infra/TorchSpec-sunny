@@ -103,6 +103,65 @@ def _create_dflash_mask_mod(
     return dflash_mask_mod
 
 
+
+def _create_dflash_attn_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+    draft_len: int,
+    kv_len: int,
+    is_causal: bool = False,
+    sliding_window: int | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Materialize the DFlash block-causal mask for SDPA.
+
+    Returns an additive float mask of shape ``[B, 1, draft_len, kv_len]`` with
+    ``0`` for allowed positions and ``-inf`` for blocked ones. Semantics match
+    :func:`_create_dflash_mask_mod` (used by FlexAttention on CUDA).
+    """
+    if draft_len < 0 or kv_len < 0:
+        raise ValueError(f"draft_len and kv_len must be non-negative, got {draft_len}, {kv_len}")
+    bsz = anchor_positions.shape[0]
+    device = anchor_positions.device
+
+    q_idx = torch.arange(draft_len, device=device).view(1, draft_len, 1)
+    kv_idx = torch.arange(kv_len, device=device).view(1, 1, kv_len)
+
+    q_block_id = q_idx // block_size
+    q_offset = q_idx % block_size
+    anchor_pos = anchor_positions.gather(1, q_block_id.squeeze(-1).expand(bsz, -1)).unsqueeze(-1)
+    valid = block_keep_mask.gather(1, q_block_id.squeeze(-1).expand(bsz, -1)).unsqueeze(-1)
+
+    is_context = kv_idx < ctx_len
+    mask_context = is_context & (kv_idx < anchor_pos)
+
+    is_draft = ~is_context
+    kv_block_id = (kv_idx - ctx_len) // block_size
+    mask_draft = is_draft & (q_block_id == kv_block_id)
+
+    if is_causal:
+        kv_offset = (kv_idx - ctx_len) % block_size
+        mask_draft = mask_draft & (kv_offset <= q_offset)
+
+    if sliding_window is not None:
+        query_position = anchor_pos + q_offset
+        mask_context = mask_context & (query_position - kv_idx < sliding_window)
+        mask_draft = mask_draft & (
+            (query_position - (anchor_pos + (kv_idx - ctx_len) % block_size)).abs() < sliding_window
+        )
+
+    allow = (mask_context | mask_draft) & valid
+    neg_inf = torch.finfo(dtype).min
+    attn_mask = torch.where(
+        allow,
+        torch.zeros((), device=device, dtype=dtype),
+        torch.full((), neg_inf, device=device, dtype=dtype),
+    )
+    return attn_mask.unsqueeze(1)  # [B, 1, Q, KV]
+
+
 class DFlashModel(nn.Module):
     """DFlash training wrapper.
 
@@ -124,6 +183,7 @@ class DFlashModel(nn.Module):
         loss_decay_gamma: float = 7.0,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
+        attention_backend: str = "sdpa",
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -134,6 +194,11 @@ class DFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dflash_dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        attention_backend = (attention_backend or "sdpa").lower()
+        if attention_backend not in {"sdpa", "flex_attention"}:
+            raise ValueError(
+                f"Unknown attention_backend {attention_backend!r}; expected 'sdpa' or 'flex_attention'"
+            )
 
         self.draft_model = draft_model
         self.block_size = block_size
@@ -143,6 +208,7 @@ class DFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
+        self.attention_backend = attention_backend
 
     @property
     def uses_target_hidden_states(self) -> bool:
@@ -238,6 +304,16 @@ class DFlashModel(nn.Module):
     ) -> tuple[torch.Tensor, dict]:
         return logits.new_zeros(()), {}
 
+
+    def _use_flex_attention(self, device: torch.device) -> bool:
+        """Prefer FlexAttention on CUDA when configured; otherwise use dense SDPA."""
+        if self.attention_backend == "flex_attention":
+            if device.type == "cuda":
+                return True
+            # NPU / CPU: FlexAttention BlockMask is CUDA-oriented; fall back to SDPA.
+            return False
+        return False
+
     def _draft_backbone(
         self,
         input_ids: torch.Tensor,
@@ -278,21 +354,23 @@ class DFlashModel(nn.Module):
             anchor_positions, seq_len
         )
 
-        # 5. Create block-causal attention mask
+        # 5. Create block-causal attention mask (Flex BlockMask or dense SDPA mask)
         draft_len = n_blocks * self.block_size
         kv_len = seq_len + draft_len
 
         block_mask = None
-        if device.type == "cuda":
-            # A mixed full/SWA schedule needs a distinct BlockMask for each
-            # attention policy.  Cache equal policies so the common uniform
-            # schedule still creates exactly one mask.
-            mask_cache = {}
-            block_masks = []
-            for layer_id in range(self.draft_model.num_layers):
-                options = self._block_mask_options_for_layer(layer_id)
-                cache_key = tuple(sorted(options.items()))
-                if cache_key not in mask_cache:
+        attn_mask = None
+        use_flex = self._use_flex_attention(device)
+        # A mixed full/SWA schedule needs a distinct mask for each attention
+        # policy.  Cache equal policies so the common uniform schedule still
+        # creates exactly one mask.
+        mask_cache = {}
+        masks = []
+        for layer_id in range(self.draft_model.num_layers):
+            options = self._block_mask_options_for_layer(layer_id)
+            cache_key = ("flex" if use_flex else "sdpa",) + tuple(sorted(options.items()))
+            if cache_key not in mask_cache:
+                if use_flex:
                     mask_mod = _create_dflash_mask_mod(
                         anchor_positions=anchor_positions,
                         block_keep_mask=block_keep_mask,
@@ -308,8 +386,26 @@ class DFlashModel(nn.Module):
                         KV_LEN=kv_len,
                         device=device,
                     )
-                block_masks.append(mask_cache[cache_key])
-            block_mask = block_masks[0] if len(mask_cache) == 1 else block_masks
+                else:
+                    # Dense additive mask for SDPA (NPU / CPU / explicit sdpa).
+                    mask_dtype = context_feature.dtype
+                    if mask_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                        mask_dtype = torch.float32
+                    mask_cache[cache_key] = _create_dflash_attn_mask(
+                        anchor_positions=anchor_positions,
+                        block_keep_mask=block_keep_mask,
+                        ctx_len=seq_len,
+                        block_size=self.block_size,
+                        draft_len=draft_len,
+                        kv_len=kv_len,
+                        dtype=mask_dtype,
+                        **options,
+                    )
+            masks.append(mask_cache[cache_key])
+        if use_flex:
+            block_mask = masks[0] if len(mask_cache) == 1 else masks
+        else:
+            attn_mask = masks[0] if len(mask_cache) == 1 else masks
 
         # 6. Draft model forward — pass embeddings directly
         draft_hidden = self.draft_model(
@@ -318,6 +414,7 @@ class DFlashModel(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            attn_mask=attn_mask,
             noise_embedding=noise_embedding,
         )
 

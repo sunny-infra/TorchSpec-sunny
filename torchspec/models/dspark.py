@@ -58,6 +58,7 @@ class DSparkModel(DFlashModel):
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 1.0,
+        attention_backend: str = "sdpa",
     ):
         # Reuse DFlash anchor/mask/noise machinery. The "decay" objective drives
         # the per-within-block position weighting shared by all DSpark terms.
@@ -68,6 +69,7 @@ class DSparkModel(DFlashModel):
             loss_objective="decay",
             dpace_alpha=0.5,
             loss_decay_gamma=loss_decay_gamma,
+            attention_backend=attention_backend,
         )
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)

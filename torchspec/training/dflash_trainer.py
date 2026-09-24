@@ -33,6 +33,11 @@ from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.training.trainer import Trainer
 from torchspec.utils.distributed import get_gloo_group
+from torchspec.utils.device import (
+    accelerator_event,
+    current_accelerator_device,
+    get_accelerator_device_type,
+)
 from torchspec.utils.logging import logger
 
 
@@ -67,6 +72,7 @@ class DFlashTrainer(Trainer):
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
+            attention_backend=getattr(self.args, "attention_backend", "sdpa"),
         )
 
     def __init__(self, args: Namespace):
@@ -89,6 +95,12 @@ class DFlashTrainer(Trainer):
         target_model_path: str,
         mooncake_config=None,
     ) -> int:
+        if get_accelerator_device_type() == "npu":
+            # NPU inductor crashes on the dynamic RoPE index (KeyError: s39 + 1)
+            # and the math SDPA fallback already materializes the score matrix.
+            torch._dynamo.config.disable = True
+            logger.info("[Rank %s] Disabled torch.compile on NPU", dist.get_rank())
+
         if mooncake_config is not None:
             from torchspec.transfer.mooncake.utils import (
                 check_mooncake_master_available,
@@ -132,8 +144,17 @@ class DFlashTrainer(Trainer):
                 config.target_num_hidden_layers = target_config.num_hidden_layers
 
             draft_model = self._build_draft_model(config)
+            draft_model.gradient_checkpointing = bool(
+                getattr(self.args, "gradient_checkpointing", False)
+            )
 
         if dist.get_rank() == 0:
+            initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
+            if initial_draft_model_path:
+                loaded_from = checkpoint.load_initial_draft_weights(
+                    draft_model, initial_draft_model_path
+                )
+                logger.info(f"[Rank 0] Loaded initial draft weights from {loaded_from}")
             draft_model.load_embedding(
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),
@@ -280,7 +301,7 @@ class DFlashTrainer(Trainer):
         dict,
         Tuple[torch.Tensor, torch.Tensor],
     ]:
-        device = torch.device("cuda")
+        device = current_accelerator_device()
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
 
@@ -495,7 +516,7 @@ class DFlashTrainer(Trainer):
             chunk = self._eval_cache[i : i + eval_mbs]
             batch = self._eval_collator(chunk)
             gpu_batch = {
-                k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+                k: v.to(current_accelerator_device()) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
             }
             all_metrics.append(self.eval_forward(gpu_batch))
 
@@ -560,10 +581,10 @@ class DFlashTrainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        evt_fwd_s = torch.cuda.Event(enable_timing=True)
-        evt_fwd_e = torch.cuda.Event(enable_timing=True)
-        evt_bwd_s = torch.cuda.Event(enable_timing=True)
-        evt_bwd_e = torch.cuda.Event(enable_timing=True)
+        evt_fwd_s = accelerator_event(enable_timing=True)
+        evt_fwd_e = accelerator_event(enable_timing=True)
+        evt_bwd_s = accelerator_event(enable_timing=True)
+        evt_bwd_e = accelerator_event(enable_timing=True)
 
         evt_fwd_s.record()
         (

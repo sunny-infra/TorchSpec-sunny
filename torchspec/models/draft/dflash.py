@@ -201,6 +201,7 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        attn_mask=None,
     ) -> torch.Tensor:
         """Forward pass with dual-source KV.
 
@@ -210,6 +211,7 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
+            attn_mask: optional dense additive SDPA mask ``[B, 1, Q, KV]``
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -264,10 +266,18 @@ class DFlashAttention(nn.Module):
                 enable_gqa=True,
             )
         else:
-            # Fallback: bidirectional attention (no mask) — expand KV for SDPA
+            # SDPA path (NPU / explicit sdpa): expand KV for GQA. When attn_mask
+            # is provided it carries the DFlash block-causal pattern.
             k = _repeat_kv(k, self.num_kv_groups)
             v = _repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=False,
+                dropout_p=0.0,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
@@ -307,6 +317,7 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        attn_mask=None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -317,6 +328,7 @@ class DFlashDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            attn_mask=attn_mask,
         )
         draft_hidden = residual + draft_hidden
 
@@ -436,6 +448,7 @@ class DFlashDraftModel(PreTrainedModel):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        attn_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
@@ -448,6 +461,7 @@ class DFlashDraftModel(PreTrainedModel):
             context_position_ids: [B, ctx_len]
             block_mask: FlexAttention BlockMask, or a per-layer sequence of
                 BlockMasks for mixed attention schedules
+            attn_mask: dense additive SDPA mask, or a per-layer sequence of masks
             noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
 
         Returns:
@@ -458,17 +472,34 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
+        use_ckpt = self.training and getattr(self, "gradient_checkpointing", False)
         for layer_id, layer in enumerate(self.layers):
             layer_block_mask = block_mask
             if isinstance(block_mask, (list, tuple)):
                 layer_block_mask = block_mask[layer_id]
-            draft_hidden = layer(
-                draft_hidden=draft_hidden,
-                context_hidden=context_feature,
-                draft_position_ids=draft_position_ids,
-                context_position_ids=context_position_ids,
-                block_mask=layer_block_mask,
-            )
+            layer_attn_mask = attn_mask
+            if isinstance(attn_mask, (list, tuple)):
+                layer_attn_mask = attn_mask[layer_id]
+            if use_ckpt:
+                draft_hidden = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    draft_hidden,
+                    context_feature,
+                    draft_position_ids,
+                    context_position_ids,
+                    layer_block_mask,
+                    layer_attn_mask,
+                    use_reentrant=False,
+                )
+            else:
+                draft_hidden = layer(
+                    draft_hidden=draft_hidden,
+                    context_hidden=context_feature,
+                    draft_position_ids=draft_position_ids,
+                    context_position_ids=context_position_ids,
+                    block_mask=layer_block_mask,
+                    attn_mask=layer_attn_mask,
+                )
 
         return self.final_norm(draft_hidden)
 

@@ -295,6 +295,7 @@ class K3DSparkMLAAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        attn_mask=None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -342,15 +343,50 @@ class K3DSparkMLAAttention(nn.Module):
                 scale=self.softmax_scale,
             )
         else:
-            # Fallback: bidirectional attention (no mask)
-            attn_output = F.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value,
-                is_causal=False,
-                dropout_p=0.0,
-                scale=self.softmax_scale,
-            )
+            # SDPA path with optional dense block-causal attn_mask (NPU / sdpa).
+            # A float mask disables the fused kernel, so the score is
+            # [heads, Q, KV]. 512 anchors x block 7 is Q=3584; at 64 heads and
+            # a 65k context one fp32 score is ~60 GiB. Run 512 queries at a
+            # time and checkpoint each chunk so only one score stays live.
+            # NPU SDPA allocates a full [heads, Q, KV] workspace even for a
+            # sliced query, which is ~57 GiB at 512 anchors. Materialize one
+            # small query block with matmul instead.
+            q_chunk = 256
+            scale = self.softmax_scale
+
+            def _attend(q, k, v, mask):
+                scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+                if mask is not None:
+                    scores = scores + mask
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+                return torch.matmul(probs, v)
+
+            if draft_len > q_chunk:
+                chunks = []
+                for start in range(0, draft_len, q_chunk):
+                    end = min(start + q_chunk, draft_len)
+                    # contiguous: an NPU SDPA view keeps the parent mask's Q
+                    # length and allocates the full [heads, 3584, KV] score.
+                    q_part = query_states[:, :, start:end].contiguous()
+                    mask_part = (
+                        None if attn_mask is None else attn_mask[:, :, start:end, :].contiguous()
+                    )
+                    if self.training and torch.is_grad_enabled():
+                        chunks.append(
+                            torch.utils.checkpoint.checkpoint(
+                                _attend,
+                                q_part,
+                                key_states,
+                                value,
+                                mask_part,
+                                use_reentrant=False,
+                            )
+                        )
+                    else:
+                        chunks.append(_attend(q_part, key_states, value, mask_part))
+                attn_output = torch.cat(chunks, dim=2)
+            else:
+                attn_output = _attend(query_states, key_states, value, attn_mask)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.v_head_dim)

@@ -7,15 +7,24 @@ import os
 _TORCHSPEC_ENV_KEYS = [
     "CUDA_LAUNCH_BLOCKING",
     "GLOO_SOCKET_IFNAME",
+    "HCCL_BUFFSIZE",
+    "HCCL_CONNECT_TIMEOUT",
+    "HCCL_OP_EXPANSION_MODE",
+    "HCCL_SOCKET_IFNAME",
     "HF_HOME",
     "HF_TOKEN",
+    "LD_LIBRARY_PATH",
     "MC_LOG_LEVEL",
     "MODELOPT_MAX_TOKENS_PER_EXPERT",
     "NCCL_DEBUG",
     "NCCL_SOCKET_IFNAME",
+    "OMP_NUM_THREADS",
+    "OMP_PROC_BIND",
+    "PYTORCH_NPU_ALLOC_CONF",
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN",
     "SGLANG_DISABLE_CUDNN_CHECK",
     "SGLANG_VLM_CACHE_SIZE_MB",
+    "TASK_QUEUE_ENABLE",
     "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC",
     "TORCHINDUCTOR_FX_GRAPH_CACHE",
     "TORCHSPEC_LOG_DIR",
@@ -23,13 +32,15 @@ _TORCHSPEC_ENV_KEYS = [
     "TP_SOCKET_IFNAME",
     "CUTE_DSL_CACHE_DIR",
     "TORCHSPEC_FLASH_ATTN_OPT_LEVEL",
+    "VLLM_ENGINE_READY_TIMEOUT_S",
     "VLLM_USE_V2_MODEL_RUNNER",
 ]
 
 _TORCHSPEC_DEFAULT_ENV_VARS = {
-    # TorchSpec's vLLM hidden-state extraction path requires Model Runner V2.
-    # An explicit process environment value still takes precedence below.
-    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    # Prefer V1 on Ascend: Model Runner V2 does not yet support
+    # speculative method extract_hidden_states used for online draft training.
+    # CUDA setups that need V2 can still override via process env / train_env_vars.
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
 }
 
 # Prevent Ray from overriding VISIBLE_DEVICES so actors manage GPU assignment themselves.

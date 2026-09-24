@@ -74,4 +74,5 @@ class DSparkTrainer(DFlashTrainer):
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
             confidence_head_alpha=self.confidence_head_alpha,
+            attention_backend=getattr(self.args, "attention_backend", "sdpa"),
         )

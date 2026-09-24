@@ -438,6 +438,32 @@ def _prepare_vllm_engines(
                     f"Replica {replica_idx}: dist_init_addr from pre-allocated port: {addr}"
                 )
 
+    dp_size = int(getattr(args, "vllm_dp_size", 1) or 1)
+    dp_address = None
+    dp_rpc_port = None
+    if dp_size > 1:
+        if nnodes != 1:
+            raise ValueError(
+                "vllm.dp_size>1 keeps tensor parallelism inside each node and joins "
+                f"engines into one expert-parallel group, so vllm.nnodes must be 1 (got {nnodes})."
+            )
+        if num_engines != dp_size:
+            raise ValueError(
+                f"vllm.dp_size={dp_size} must equal the number of vLLM engines "
+                f"({num_engines}). Each engine is one data-parallel rank."
+            )
+        dp_address = ray.get(engines[0].get_node_ip.remote(), timeout=30)
+        dp_rpc_port = ray.get(
+            engines[0].find_free_port.remote(start_port=29500, consecutive=1),
+            timeout=30,
+        )
+        logger.info(
+            "vLLM expert-parallel group: dp_size=%d address=%s:%s",
+            dp_size,
+            dp_address,
+            dp_rpc_port,
+        )
+
     init_handles = []
     for i, engine in enumerate(engines):
         replica_idx = i // nnodes if nnodes > 1 else i
@@ -446,6 +472,9 @@ def _prepare_vllm_engines(
                 mooncake_config=mooncake_config,
                 dist_init_addr=dist_init_addrs.get(replica_idx),
                 pre_allocated_port=pre_allocated_ports.get(i),
+                dp_size=dp_size,
+                dp_address=dp_address,
+                dp_rpc_port=dp_rpc_port,
             )
         )
 

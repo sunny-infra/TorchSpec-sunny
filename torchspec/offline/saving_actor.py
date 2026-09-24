@@ -39,43 +39,103 @@ class OfflineSavingActor:
             sample = self.queues[split].get()
             if not sample.data_id:
                 raise ValueError("Offline saving requires TrainSample.data_id")
-            if (sample.metadata or {}).get("vllm_pp_layer_manifest") is not None:
-                # Under vLLM pipeline parallelism each stage writes its own
-                # per-layer fragments and the base key is never written, so a
-                # plain get() here would miss the data and then "clean up" a
-                # key that does not exist while every fragment leaks.
-                raise NotImplementedError(
-                    "Offline saving does not support vLLM pipeline parallelism yet; "
-                    f"sample {sample.data_id} carries a per-layer PP manifest. "
-                    "Generate offline data with vllm_pp_size=1."
-                )
             dtypes = {
                 key: getattr(torch, value.replace("torch.", ""))
                 if isinstance(value, str)
                 else value
                 for key, value in (sample.tensor_dtypes or {}).items()
             }
-            output = self.store.get(
-                key=sample.mooncake_key,
-                shapes=sample.tensor_shapes,
-                dtypes=dtypes,
-                device=torch.device("cpu"),
-            )
+            metadata = sample.metadata or {}
+            manifest = metadata.get("vllm_pp_layer_manifest")
+            if manifest is not None:
+                tensors = self._load_layer_fragments(sample, manifest, dtypes)
+            else:
+                tensors = self.store.get(
+                    key=sample.mooncake_key,
+                    shapes=sample.tensor_shapes,
+                    dtypes=dtypes,
+                    device=torch.device("cpu"),
+                ).to_tensor_dict()
             try:
                 written += self.dataset.append(
                     split,
                     data_id=sample.data_id,
-                    tensors=output.to_tensor_dict(),
+                    tensors=tensors,
                     packed_loss_mask=sample.packed_loss_mask,
                     metadata=sample.metadata,
                 )
             finally:
-                self.store.remove_eagle3_tensors(
-                    sample.mooncake_key,
-                    has_last_hidden_states="last_hidden_states" in sample.tensor_shapes,
-                    has_target="target" in sample.tensor_shapes,
-                )
+                if manifest is None:
+                    self.store.remove_eagle3_tensors(
+                        sample.mooncake_key,
+                        has_last_hidden_states="last_hidden_states" in sample.tensor_shapes,
+                        has_target="target" in sample.tensor_shapes,
+                    )
         return written
+
+    def _load_layer_fragments(self, sample, manifest, dtypes) -> dict[str, torch.Tensor]:
+        """Assemble the per-layer objects the connector publishes.
+
+        TP and PP both write ``{key}_layer{id}_hs`` instead of one packed
+        hidden-state object. Each fragment is one captured layer.
+        """
+        metadata = sample.metadata or {}
+        if not metadata.get("vllm_pp_complete", False):
+            raise RuntimeError(
+                f"Incomplete hidden-state sample {sample.data_id}: "
+                f"mooncake_key={sample.mooncake_key}"
+            )
+
+        seq_len = sample.tensor_shapes["input_ids"][0]
+        hidden_size = sample.tensor_shapes["last_hidden_states"][-1]
+        fragment_shapes = {
+            "hidden_states": (seq_len, hidden_size),
+            "input_ids": (seq_len,),
+        }
+        fragment_dtypes = {
+            "hidden_states": dtypes.get("hidden_states", torch.bfloat16),
+            "input_ids": torch.int64,
+        }
+
+        hidden_states = []
+        last_hidden_states = None
+        input_ids = None
+        for entry in manifest:
+            key = entry["mooncake_key"]
+            tensors = (
+                self.store.get(
+                    key=key,
+                    shapes=fragment_shapes,
+                    dtypes=fragment_dtypes,
+                    device=torch.device("cpu"),
+                )
+                .to_tensor_dict()
+            )
+            cloned = {name: tensor.clone() for name, tensor in tensors.items()}
+            layer_hidden = cloned["hidden_states"]
+            layer_input_ids = cloned["input_ids"]
+            if input_ids is None:
+                input_ids = layer_input_ids
+            elif not torch.equal(input_ids, layer_input_ids):
+                raise RuntimeError(f"Hidden-state input_ids mismatch for fragment {key}")
+
+            if entry["role"] == "last_hidden_states":
+                last_hidden_states = layer_hidden
+            else:
+                hidden_states.append(layer_hidden)
+            self.store.remove_eagle3_tensors(
+                key,
+                has_last_hidden_states=False,
+                has_target=False,
+            )
+
+        if not hidden_states or last_hidden_states is None or input_ids is None:
+            raise RuntimeError(f"Invalid hidden-state layer manifest for {sample.mooncake_key}")
+        return {
+            "hidden_states": torch.cat(hidden_states, dim=-1),
+            "last_hidden_states": last_hidden_states,
+            "input_ids": input_ids,
+        }
 
     def counts(self) -> dict[str, int]:
         return {split: self.dataset.count(split) for split in ("train", "eval")}

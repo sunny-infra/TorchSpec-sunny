@@ -52,6 +52,24 @@ _DTYPE_ELEMENT_SIZES = {
 HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
 
 
+def _tensor_needs_copy_sync(tensor: torch.Tensor) -> bool:
+    return bool(tensor.is_cuda or getattr(tensor, "is_npu", False))
+
+
+def _synchronize_accelerator_copies(tensors: list[torch.Tensor]) -> None:
+    """Wait until non-blocking copies from these tensors are visible."""
+    seen: set[tuple[str, int | None]] = set()
+    for tensor in tensors:
+        if not _tensor_needs_copy_sync(tensor):
+            continue
+        key = (tensor.device.type, tensor.device.index)
+        if key in seen:
+            continue
+        seen.add(key)
+        module = torch.cuda if tensor.device.type == "cuda" else torch.npu
+        module.current_stream(tensor.device).synchronize()
+
+
 class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
     Mooncake Store wrapper specialized for Eagle3 hidden states.
@@ -106,10 +124,19 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             self._async_put_manager.check_last_error()
             self._async_put_manager.wait_for_buffer(buf.ptr)
 
-            # Offline replay tensors are already on the host, so CUDA event and
-            # stream synchronization is both unnecessary and unavailable.
+            # Offline replay tensors are already on the host, so stream
+            # synchronization is both unnecessary and unavailable.
+            if not any(_tensor_needs_copy_sync(tensor) for tensor in tensors):
+                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                self._async_put_manager.submit(keys, buffer_ptrs, sizes, buf.ptr)
+                return
+
+            # NPU copies land in the pinned buffer with non_blocking=True, but
+            # there is no CUDA event for AsyncPutManager to wait on. Finish
+            # those copies before Mooncake reads the buffer.
             if not any(tensor.is_cuda for tensor in tensors):
                 buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                _synchronize_accelerator_copies(tensors)
                 self._async_put_manager.submit(keys, buffer_ptrs, sizes, buf.ptr)
                 return
 

@@ -56,10 +56,11 @@ def get_free_port(start_port=10000, consecutive=1):
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    # Prefer CUDA remapping; fall back to Ascend visible-devices when present.
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
     if not cvd:
         return physical_gpu_id  # no remapping
-    # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
+    # VISIBLE_DEVICES can be like "4,5,6,7"
     visible = [int(x) for x in cvd.split(",") if x.strip() != ""]
     # In a remapped process, valid torch device indices are 0..len(visible)-1
     if physical_gpu_id in visible:
@@ -67,8 +68,9 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     # If we're already getting local IDs, allow them
     if 0 <= physical_gpu_id < len(visible):
         return physical_gpu_id
+    env_name = "CUDA_VISIBLE_DEVICES" if os.environ.get("CUDA_VISIBLE_DEVICES") else "ASCEND_RT_VISIBLE_DEVICES"
     raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
+        f"GPU id {physical_gpu_id} is not valid under {env_name}={cvd}. "
         f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
     )
 

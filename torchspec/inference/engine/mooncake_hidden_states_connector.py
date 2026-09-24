@@ -66,22 +66,49 @@ def _sanitize_mooncake_key(key: str) -> str:
     return sanitized
 
 
+def _hidden_cache_layout(kv_cache: torch.Tensor, block_size: int) -> str:
+    """Return the axis order of a 4D hidden-state cache view.
+
+    ``LBNHC`` is ``(blocks, layers, block_size, hidden)``, the layout newer
+    vLLM standardizes on. ``NHD`` is ``(blocks, block_size, layers, hidden)``,
+    which ``CacheOnlyAttentionBackend.get_kv_cache_shape`` allocates. On that
+    layout the layer axis equals the number of captured hidden states, so it
+    must not be read as the block size.
+    """
+    if kv_cache.dim() != 4:
+        raise ValueError(
+            f"Expected a 4D hidden-state cache, got shape={tuple(kv_cache.shape)}"
+        )
+    if kv_cache.shape[2] == block_size:
+        return "LBNHC"
+    if kv_cache.shape[1] == block_size:
+        return "NHD"
+    raise ValueError(
+        "Hidden-state block-size mismatch: "
+        f"derived {block_size}, cache view shape {tuple(kv_cache.shape)}"
+    )
+
+
 def _extract_from_kv_cache(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     num_tokens: int,
+    block_size: int | None = None,
 ) -> torch.Tensor:
-    """Extract data from an LBNHC hidden-state cache view.
+    """Extract ``(num_tokens, layers, hidden)`` from the hidden-state cache.
 
-    ``kv_cache`` has shape ``(num_blocks, num_heads, block_size, head_size)``.
-    This matches latest vLLM's standardized hidden-state connector layout.
+    ``block_size`` is the scheduler page size. When omitted, the historical
+    LBNHC view is assumed and the page size is ``kv_cache.shape[2]``.
     """
-    block_size = kv_cache.shape[2]
-    return kv_cache[
-        slot_mapping // block_size,
-        :,
-        slot_mapping % block_size,
-    ][:num_tokens]
+    if block_size is None:
+        block_size = kv_cache.shape[2]
+    block_ids = slot_mapping // block_size
+    offsets = slot_mapping % block_size
+    if _hidden_cache_layout(kv_cache, block_size) == "LBNHC":
+        extracted = kv_cache[block_ids, :, offsets]
+    else:
+        extracted = kv_cache[block_ids, offsets]
+    return extracted[:num_tokens]
 
 
 def _slot_mapping_from_block_ids(
@@ -101,17 +128,24 @@ def _cache_layer_fragments(
     block_ids: list[int],
     layer_position: int,
     num_tokens: int,
+    block_size: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Return registered-cache source slices for one logical layer tensor.
 
-    The required vLLM layout is ``(blocks, layers, block_size, hidden)``.
-    Tokens for one layer are contiguous inside each block, so Mooncake's
-    multi-buffer put can concatenate those block slices into the exact
-    ``(num_tokens, hidden)`` object consumed by training.
+    LBNHC keeps one layer's tokens contiguous inside each block, so a block is
+    one buffer. NHD stores layers inside each token, so each token is its own
+    buffer. Both concatenate to the ``(num_tokens, hidden)`` training object.
     """
-    if kv_cache.dim() != 4:
-        raise ValueError(f"Expected a 4D LBNHC cache, got shape={tuple(kv_cache.shape)}")
-    num_blocks, num_layers, block_size, hidden_size = kv_cache.shape
+    page_size = kv_cache.shape[2] if block_size is None else block_size
+    layout = _hidden_cache_layout(kv_cache, page_size)
+    if layout == "LBNHC":
+        num_blocks, num_layers, page_size, hidden_size = kv_cache.shape
+        layer_dim = 1
+        tokens_contiguous = kv_cache.stride(2) == hidden_size
+    else:
+        num_blocks, page_size, num_layers, hidden_size = kv_cache.shape
+        layer_dim = 2
+        tokens_contiguous = False
     if not 0 <= layer_position < num_layers:
         raise ValueError(
             f"Layer position {layer_position} is outside hidden-state cache shape "
@@ -119,11 +153,14 @@ def _cache_layer_fragments(
         )
     if num_tokens <= 0:
         raise ValueError(f"Expected a positive token count, got {num_tokens}")
-    if len(block_ids) * block_size < num_tokens:
+    if len(block_ids) * page_size < num_tokens:
         raise ValueError(
-            f"Hidden-state cache has {len(block_ids) * block_size} slots for {num_tokens} tokens"
+            f"Hidden-state cache has {len(block_ids) * page_size} slots for {num_tokens} tokens"
         )
-    if kv_cache.stride(3) != 1 or kv_cache.stride(2) != hidden_size:
+    hidden_is_contiguous = kv_cache.stride(3) == 1 and (
+        not tokens_contiguous or kv_cache.stride(2) == hidden_size
+    )
+    if not hidden_is_contiguous:
         raise ValueError(
             "Hidden-state cache tokens are not contiguous within each block: "
             f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
@@ -139,10 +176,22 @@ def _cache_layer_fragments(
             raise ValueError(f"Hidden-state block id {block_id} is outside [0, {num_blocks})")
         if remaining == 0:
             break
-        tokens_in_block = min(block_size, remaining)
-        element_offset = block_id * kv_cache.stride(0) + layer_position * kv_cache.stride(1)
-        ptrs.append(base_ptr + element_offset * element_size)
-        sizes.append(tokens_in_block * hidden_size * element_size)
+        tokens_in_block = min(page_size, remaining)
+        if tokens_contiguous:
+            element_offset = (
+                block_id * kv_cache.stride(0) + layer_position * kv_cache.stride(layer_dim)
+            )
+            ptrs.append(base_ptr + element_offset * element_size)
+            sizes.append(tokens_in_block * hidden_size * element_size)
+        else:
+            for token in range(tokens_in_block):
+                element_offset = (
+                    block_id * kv_cache.stride(0)
+                    + token * kv_cache.stride(1)
+                    + layer_position * kv_cache.stride(layer_dim)
+                )
+                ptrs.append(base_ptr + element_offset * element_size)
+                sizes.append(hidden_size * element_size)
         remaining -= tokens_in_block
 
     if remaining:
@@ -378,11 +427,13 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
         )
         self._kv_cache = kv_caches[self.cache_layers[0]]
-        if self._block_size != self._kv_cache.shape[2]:
-            raise ValueError(
-                "Hidden-state block-size mismatch: "
-                f"derived {self._block_size}, cache view has {self._kv_cache.shape[2]}"
-            )
+        self._cache_layout = _hidden_cache_layout(self._kv_cache, self._block_size)
+        logger.info(
+            "Mooncake hidden-state cache layout %s shape=%s block_size=%s",
+            self._cache_layout,
+            tuple(self._kv_cache.shape),
+            self._block_size,
+        )
         self._register_hidden_state_cache_for_gpu_direct()
 
     def _register_hidden_state_cache_for_gpu_direct(self) -> None:
@@ -416,7 +467,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         try:
             # Validate the layout before paying the RDMA registration cost.
-            _cache_layer_fragments(self._kv_cache, [0], 0, 1)
+            _cache_layer_fragments(
+                self._kv_cache, [0], 0, 1, getattr(self, "_block_size", None)
+            )
             cache_nbytes = self._kv_cache.numel() * self._kv_cache.element_size()
             self._cache_gpu_direct_registered = self._mooncake_store.register_external_buffer(
                 self._kv_cache.data_ptr(), cache_nbytes
@@ -475,6 +528,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._kv_cache,
             slot_mapping,
             num_tokens,
+            self._block_size,
         )
         if hidden_states_3d.dtype != torch.bfloat16:
             hidden_states_3d = hidden_states_3d.to(torch.bfloat16)
@@ -554,6 +608,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     pending.block_ids,
                     position,
                     num_tokens,
+                    getattr(self, "_block_size", None),
                 )
                 hidden_keys.append(f"{layer_key}_hs")
                 hidden_ptrs.append(ptrs)

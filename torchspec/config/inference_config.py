@@ -86,6 +86,10 @@ class VllmConfig:
     tp_size: int = 8
     pp_size: int = 1
     nnodes: int = 1
+    # Join this many single-node engines into one expert-parallel group.
+    # Tensor parallelism stays inside each node; MoE EP degree is tp_size * dp_size.
+    # 1 keeps each engine as an independent TP group.
+    dp_size: int = 1
 
     # Memory (None = auto-compute from connector overhead; see VllmEngine)
     mem_fraction_static: Optional[float] = None

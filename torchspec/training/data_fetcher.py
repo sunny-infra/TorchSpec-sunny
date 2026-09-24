@@ -42,6 +42,7 @@ from torchspec.utils.distributed import (
     get_sp_ring_group,
     get_usp_rank_coords,
 )
+from torchspec.utils.device import accelerator_current_stream
 from torchspec.utils.logging import logger
 
 
@@ -55,9 +56,16 @@ def _clone_fragment_before_receive_buffer_reuse(
     subsequent GET can reuse and overwrite that buffer.
     """
     cloned = {name: tensor.clone() for name, tensor in tensors.items()}
-    cuda_tensor = next((tensor for tensor in cloned.values() if tensor.is_cuda), None)
-    if cuda_tensor is not None:
-        torch.cuda.current_stream(cuda_tensor.device).synchronize()
+    accel_tensor = next(
+        (
+            tensor
+            for tensor in cloned.values()
+            if tensor.is_cuda or getattr(tensor, "is_npu", False)
+        ),
+        None,
+    )
+    if accel_tensor is not None:
+        accelerator_current_stream(accel_tensor.device).synchronize()
     return cloned
 
 

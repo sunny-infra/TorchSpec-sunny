@@ -128,6 +128,9 @@ class VllmEngine(InferenceEngine, RayActor):
         mooncake_config=None,
         dist_init_addr: str | None = None,
         pre_allocated_port: int | None = None,
+        dp_size: int = 1,
+        dp_address: str | None = None,
+        dp_rpc_port: int | None = None,
     ) -> None:
         if self.base_gpu_id is not None:
             self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
@@ -233,7 +236,15 @@ class VllmEngine(InferenceEngine, RayActor):
         )
 
         self._init_engine(
-            tp_size, pp_size, nnodes, mem_fraction, dist_init_addr, pre_allocated_port
+            tp_size,
+            pp_size,
+            nnodes,
+            mem_fraction,
+            dist_init_addr,
+            pre_allocated_port,
+            dp_size=dp_size,
+            dp_address=dp_address,
+            dp_rpc_port=dp_rpc_port,
         )
 
         # Only node_rank=0 owns the LLM front end.  Follower nodes run vLLM's
@@ -257,6 +268,9 @@ class VllmEngine(InferenceEngine, RayActor):
         mem_fraction: float | None,
         dist_init_addr: str | None,
         pre_allocated_port: int | None = None,
+        dp_size: int = 1,
+        dp_address: str | None = None,
+        dp_rpc_port: int | None = None,
     ) -> None:
         """Initialize LLM with extract_hidden_states speculative config."""
         # Pin vLLM's mp workers to the correct physical GPUs.  Without this,
@@ -291,6 +305,14 @@ class VllmEngine(InferenceEngine, RayActor):
                     "torchspec.inference.engine.mooncake_hidden_states_connector"
                 ),
                 "kv_role": "kv_producer",
+                # Same allocator switches as the hs4 hidden-state service.
+                # The packed-KV patches read these flags and keep the
+                # hidden-state cache in its own pool instead of inflating
+                # attention-page admission.
+                "kv_connector_extra_config": {
+                    "enable_cross_layers_blocks": "False",
+                    "enable_separate_hidden_state_pool": "True",
+                },
             },
         }
 
@@ -353,6 +375,32 @@ class VllmEngine(InferenceEngine, RayActor):
         if nnodes > 1:
             engine_kwargs["nnodes"] = nnodes
             engine_kwargs["node_rank"] = self.node_rank
+
+        if dp_size > 1:
+            if not dp_address or dp_rpc_port is None:
+                raise ValueError(
+                    "vllm.dp_size>1 requires a shared data-parallel address and rpc port"
+                )
+            # LLM(data_parallel_size>1) is rejected for single-process use.
+            # Offline SPMD sets VLLM_DP_* instead: each engine is one DP rank,
+            # TP stays inside the node, and MoE EP spans tp_size * dp_size.
+            # All ranks must enter generate() together.
+            local_ip = self.get_node_ip()
+            os.environ.setdefault("HCCL_SOCKET_IFNAME", "eth0")
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
+            os.environ.setdefault("TP_SOCKET_IFNAME", "eth0")
+            os.environ["HCCL_IF_IP"] = local_ip
+            os.environ["VLLM_DP_SIZE"] = str(dp_size)
+            os.environ["VLLM_DP_RANK"] = str(self.rank)
+            os.environ["VLLM_DP_RANK_LOCAL"] = "0"
+            os.environ["VLLM_DP_MASTER_IP"] = dp_address
+            os.environ["VLLM_DP_MASTER_PORT"] = str(int(dp_rpc_port))
+            engine_kwargs["enable_expert_parallel"] = True
+            logger.info(
+                f"VllmEngine rank {self.rank}: expert-parallel DP "
+                f"VLLM_DP_RANK={self.rank} VLLM_DP_SIZE={dp_size} "
+                f"master={dp_address}:{dp_rpc_port} local_ip={local_ip}"
+            )
 
         if mem_fraction is not None:
             engine_kwargs["gpu_memory_utilization"] = mem_fraction
