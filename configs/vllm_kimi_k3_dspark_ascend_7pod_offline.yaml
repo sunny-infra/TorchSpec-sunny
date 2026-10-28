@@ -1,0 +1,143 @@
+# Kimi-K3 DSpark offline hidden-state materialization — 8 inference pods.
+#
+# sy0–sy7 are on supernode 2f377d71. TP16 stays inside each pod.
+# DP8 joins them into one expert-parallel group:
+#   EP = 16 * 8 = 128, 896 experts / 128 = 7 per card.
+# Ray must contain only these 8 nodes (16 GPUs each). Offline generate builds
+# an inference-only placement group, so node IPs are not pinned here.
+#
+# aux layers match Kimi-K3-DSpark-Inferact target_layer_ids.
+# training.max_seq_length overrides vLLM max_model_len.
+
+model:
+  target_model_path: /a3_inference/itask/workdir/shared/models/modelhub_69400046_kimi-k3-w4a8-norope-142600122_20260824234539/model
+  draft_model_config: /a3_inference/itask/workdir/shared/wjf02357757/Kimi-K3-DSpark-Inferact/config.json
+  target_model_backend: vllm
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  norm_key: language_model.model.norm.weight
+
+dataset:
+  train_data_path: /a3_inference/itask/workdir/shared/libowen/success.jsonl
+  eval_data_path: null
+  eval_interval: 50
+  eval_prompt_key: messages
+  prompt_key: messages
+  renderer: kimi-k3
+  chat_template: null
+  defer_tokenization: false
+  last_turn_loss_only: true
+  shuffle_dataset: true
+  length_group_size: 1
+  min_loss_tokens: 14
+
+training:
+  max_seq_length: 65537
+  seed: 42
+  micro_batch_size: 1
+  draft_accumulation_steps: 8
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.04
+  lr_decay_style: cosine
+  min_lr: 0.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  ttt_length: 7
+  num_epochs: 5
+  save_interval: 1000
+  save_per_epoch: true
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+  attention_backend: sdpa
+  distributed_backend: hccl
+  placement_strategy: training_first
+  training_num_nodes: 1
+  training_num_gpus_per_node: 16
+  fsdp_strategy: FULL_SHARD
+  distributed_timeout_minutes: 60
+
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+  load_path: /a3_inference/itask/workdir/shared/wjf02357757/kimi_k3_dspark_init
+  continual_training: true
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 128
+  inference_num_gpus_per_engine: 16
+  inference_num_gpus_per_node: 16
+  inference_batch_size: 1
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 8
+  max_sample_pool_size: 32
+  store_last_hidden_states: true
+  aux_hidden_states_layers: [2, 23, 47, 71, 89]
+  last_hidden_states_prenorm: true
+
+  vllm:
+    tp_size: 16
+    pp_size: 1
+    nnodes: 1
+    dp_size: 8
+    init_timeout: 3600
+    dist_timeout: 1800
+    mem_fraction_static: 0.90
+    extra_args:
+      quantization: ascend
+      enable_expert_parallel: true
+      enforce_eager: true
+      max_model_len: 65537
+      max_num_batched_tokens: 8192
+      max_num_seqs: 1
+      enable_chunked_prefill: true
+      enable_prefix_caching: false
+      seed: 1024
+      safetensors_load_strategy: prefetch
+      mamba_cache_mode: align
+      mm_processor_cache_gb: 4
+      compilation_config:
+        cudagraph_mode: FULL_DECODE_ONLY
+      additional_config:
+        enable_cpu_binding: true
+        enable_flashcomm1: false
+        multistream_overlap_shared_expert: true
+        enable_shared_expert_dp: false
+        recompute_scheduler_enable: false
+        finegrained_tp_config:
+          markov_tensor_parallel_size: 1
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  enable_gpu_direct: false
+  hidden_dim: 7168
+  enable_hard_pin: true
+  kv_lease_ttl_s: 180.0
+  get_retry_max_wait_seconds: 180.0
+  global_segment_size: 256GB
+  local_buffer_size: 8GB
+
+output_dir: /a3_inference/itask/workdir/shared/wjf02357757/outputs/kimi-k3-dspark-ascend
+cache_dir: /a3_inference/itask/workdir/shared/wjf02357757/cache/kimi-k3-dspark-ascend
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  enable_perf_metrics: true
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: train_kimi_k3_dspark_ascend
+  wandb_team: null
+  wandb_group: null
+  wandb_mode: online
+  wandb_random_suffix: true
